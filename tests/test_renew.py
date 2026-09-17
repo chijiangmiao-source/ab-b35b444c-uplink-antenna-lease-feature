@@ -49,7 +49,8 @@ RENEW_RESPONSE_FIELDS = {
     "replay",
 }
 
-# The renewal feature must not reshape the original responses.
+# The renewal feature must not reshape the original responses beyond the
+# control generation every lease now carries.
 ACQUIRE_RESPONSE_FIELDS = {
     "antenna_id",
     "controller",
@@ -57,6 +58,7 @@ ACQUIRE_RESPONSE_FIELDS = {
     "acquired_at",
     "expires_at",
     "replay",
+    "control_generation",
 }
 STATUS_RESPONSE_FIELDS = {
     "antenna_id",
@@ -68,6 +70,7 @@ STATUS_RESPONSE_FIELDS = {
     "last_command_sequence",
     "last_progress_at",
     "released_at",
+    "control_generation",
 }
 
 
@@ -112,15 +115,29 @@ def _insert_near_future_lease(
     """
     token = f"near-{uuid.uuid4()}"
     with db_engine.begin() as conn:
+        # Allocate the control generation exactly like the service does.
+        generation = conn.execute(
+            text(
+                """
+                UPDATE antennas
+                SET last_control_generation = last_control_generation + 1
+                WHERE id = :antenna_id
+                RETURNING last_control_generation
+                """
+            ),
+            {"antenna_id": antenna_id},
+        ).scalar_one()
         row = conn.execute(
             text(
                 """
                 INSERT INTO leases (antenna_id, controller, token,
-                                    acquired_at, expires_at)
+                                    acquired_at, expires_at,
+                                    control_generation)
                 VALUES (
                     :antenna_id, :controller, :token,
                     clock_timestamp() - make_interval(secs => :ttl - :left),
-                    clock_timestamp() + make_interval(secs => :left)
+                    clock_timestamp() + make_interval(secs => :left),
+                    :generation
                 )
                 RETURNING token, acquired_at, expires_at
                 """
@@ -131,6 +148,7 @@ def _insert_near_future_lease(
                 "token": token,
                 "ttl": ttl_seconds,
                 "left": remaining_seconds,
+                "generation": generation,
             },
         ).mappings().one()
     return dict(row)

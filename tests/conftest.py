@@ -59,7 +59,9 @@ def db_engine() -> Engine:
 def reset_lease_tables(db_engine: Engine):
     """Each test starts with a clean lease/idempotency state.
 
-    The seeded antenna catalog is intentionally preserved.
+    The seeded antenna catalog is intentionally preserved; the per-antenna
+    generation counters derive from committed leases, so they restart at
+    zero together with the truncated lease tables.
     """
     with db_engine.begin() as conn:
         conn.execute(
@@ -68,6 +70,7 @@ def reset_lease_tables(db_engine: Engine):
                 "lease_renewals, leases RESTART IDENTITY CASCADE"
             )
         )
+        conn.execute(text("UPDATE antennas SET last_control_generation = 0"))
     yield
 
 
@@ -150,20 +153,39 @@ def insert_expired_lease(
     controller: str = "expired-ctrl",
     token: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a lease that expired ``age_seconds`` ago, directly via SQL."""
+    """Insert a lease that expired ``age_seconds`` ago, directly via SQL.
+
+    The control generation is allocated exactly like the service does it —
+    the antenna counter is bumped under its row lock and the new value is
+    frozen into the row — so seeded history never breaks the invariant
+    ``antennas.last_control_generation == max(leases.control_generation)``.
+    """
     token = token or f"expired-{uuid.uuid4()}"
     with db_engine.begin() as conn:
+        generation = conn.execute(
+            text(
+                """
+                UPDATE antennas
+                SET last_control_generation = last_control_generation + 1
+                WHERE id = :antenna_id
+                RETURNING last_control_generation
+                """
+            ),
+            {"antenna_id": antenna_id},
+        ).scalar_one()
         row = conn.execute(
             text(
                 """
                 INSERT INTO leases (antenna_id, controller, token,
-                                    acquired_at, expires_at)
+                                    acquired_at, expires_at,
+                                    control_generation)
                 VALUES (
                     :antenna_id, :controller, :token,
                     clock_timestamp() - make_interval(secs => :age + :ttl),
-                    clock_timestamp() - make_interval(secs => :age)
+                    clock_timestamp() - make_interval(secs => :age),
+                    :generation
                 )
-                RETURNING token, acquired_at, expires_at
+                RETURNING token, acquired_at, expires_at, control_generation
                 """
             ),
             {
@@ -172,9 +194,19 @@ def insert_expired_lease(
                 "token": token,
                 "age": age_seconds,
                 "ttl": ttl_seconds,
+                "generation": generation,
             },
         ).mappings().one()
     return dict(row)
+
+
+def antenna_generation(db_engine: Engine, antenna_id: str) -> int:
+    """Current committed ``last_control_generation`` of an antenna."""
+    return count_rows(
+        db_engine,
+        "SELECT last_control_generation FROM antennas WHERE id = :antenna_id",
+        antenna_id=antenna_id,
+    )
 
 
 def parallel_acquire(

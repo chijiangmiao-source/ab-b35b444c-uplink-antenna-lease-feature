@@ -18,6 +18,11 @@
   （`POST /leases/{lease_token}/progress`）：序号只能递增，相同序号重放返回原记录时间，
   上报**不会延长租约占用期限**；
 - 未知天线、越界租期返回稳定错误，且**不落任何库记录**。
+- **控制代次（control_generation）防脑裂**：上行设备在网络分区恢复后可能继续发送
+  旧租约指令。每次成功取得天线，租约都会固化该天线**单调递增的控制代次**
+  （每副天线独立计数，从 1 开始，逐次 +1）；设备只服从所见最大代次的持有者，
+  过期控制者的指令可被直接拒绝。天线忙、未知天线、参数冲突、输入拒绝等
+  失败路径**不消耗代次**——失败后的首次成功恰好紧接该天线上一次已提交租约的代次。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16（`pgcrypto`）· Alembic · pytest。
 
@@ -87,8 +92,9 @@ docker compose run --build verify
 ```
 
 验收测试会通过独立的数据库连接截断 `leases` / `idempotency_keys` /
-`lease_renewals` / `renewal_idempotency_keys` 表以保证用例独立，
-因此请在测试环境运行（预置天线目录不会被清除）。
+`lease_renewals` / `renewal_idempotency_keys` 表并把各天线的
+`last_control_generation` 归零（计数器派自已提交的租约，租约清空后从 0 重启），
+以保证用例独立，因此请在测试环境运行（预置天线目录不会被清除）。
 
 ---
 
@@ -131,6 +137,14 @@ alembic downgrade base    # 回滚全部迁移
   `renewal_idempotency_keys(idempotency_key PK, renewal_id FK,
   request_params, created_at)`。续期幂等键与获取幂等键分表存放，
   两类操作各自独立去重；迁移不改动任何历史租约。
+- `alembic/versions/0004_control_generation.py`：增加
+  `antennas.last_control_generation BIGINT NOT NULL`（该天线已分配的
+  最大代次，初值 0）与 `leases.control_generation BIGINT NOT NULL`
+  （租约取得时固化的代次，CHECK `>= 1`），并以唯一索引
+  `(antenna_id, control_generation)` 保证同一副天线的代次绝不重复发放。
+  **历史租约按同一天线的取得时间与记录编号**（`acquired_at, id`）
+  顺序补写 1..N 的代次，天线计数器接续到该最大值，因此升级后历史查询
+  返回稳定结果，且升级后的首次获取与历史代次无缝衔接。
 
 ---
 
@@ -156,9 +170,18 @@ alembic downgrade base    # 回滚全部迁移
   "lease_token": "k3J9...（32 随机字节的 base64url 无填充编码，43 个字符，仅含 A–Z a–z 0–9 - _，可直接放进 URL 路径段；PostgreSQL CSPRNG 生成，不可预测）",
   "acquired_at": "2026-09-12T04:00:00.123456+00:00",
   "expires_at": "2026-09-12T04:00:30.123456+00:00",
+  "control_generation": 7,
   "replay": false
 }
 ```
+
+`control_generation` 是该天线**单调递增的控制代次**：每次成功取得天线时，
+获取事务在天线行锁内把 `antennas.last_control_generation` 加一并固化进租约。
+上行设备在网络分区恢复后可能继续发送旧租约的指令——地面站只服从所见最大代次
+的持有者，过期控制者的指令可直接拒绝。代次**只在成功取得时分配**：
+天线忙、未知天线、幂等参数冲突、输入校验拒绝都不消耗代次，失败后的首次成功
+恰好紧接该天线上一次已提交租约的代次（无空洞）。同键同参重放返回**原代次**，
+令牌查询返回的是租约取得时固化的值。
 
 时间戳在所有接口（获取、重放、令牌查询）中使用**完全一致的 ISO-8601 带显式偏移量**
 表示（`+00:00`，不混用 `Z`），可逐字节比较；同一个 `expires_at` 在获取与查询响应中
@@ -262,6 +285,7 @@ curl -sS -X POST http://localhost:8000/leases \
   "acquired_at": "…",
   "expires_at": "…",
   "active": true,
+  "control_generation": 7,
   "last_command_sequence": 3,
   "last_progress_at": "2026-09-12T04:05:06.789012+00:00"
 }
@@ -340,7 +364,7 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/renew \
 ### 4.6 其他接口
 
 - `GET /leases/{lease_token}` — 查询租约与 `active` 状态（以数据库时间实时计算），
-  含上述两个可空进度字段和可空的 `released_at`；
+  含取得时固化的 `control_generation`、上述两个可空进度字段和可空的 `released_at`；
 - `GET /antennas` — 预置天线目录；
 - `GET /health` — 存活探针，返回数据库时钟 `database_time`；
 - 交互式文档：`GET /docs`（Swagger UI）。
@@ -358,7 +382,11 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/renew \
    —— 串行化同天线的所有争抢者，同时完成“天线必须存在”的校验（未知天线在此之前无任何写入）；
 4. 以 `released_at IS NULL AND expires_at > clock_timestamp()` 判定活跃租约：
    未到期且未释放 → `ANTENNA_BUSY`；已释放或 `expires_at` 已到达 → 归新请求；
-5. 插入新租约与幂等记录并提交（同事务原子完成）。
+5. 在天线行锁内把 `antennas.last_control_generation` 加一，将新代次作为
+   `control_generation` 写入新租约，并同事务插入幂等记录后提交。
+   计数器只在**将要提交**的事务内移动：并发交接只有新持有者得到更大代次，
+   任何拒绝路径（忙、未知天线、参数冲突、输入非法）都会随回滚撤销这次自增，
+   因此失败从不消耗代次，成功序列无空洞。
 
 进度上报（`POST /leases/{token}/progress`）在同样的单事务模型内：
 
@@ -439,6 +467,13 @@ pytest
   同键改参/换令牌为 `IDEMPOTENCY_CONFLICT`、未知/已到期/已释放令牌拒绝且
   零落库且不影响后来持有者、输入校验（4/121、文本、缺字段、多余字段、边界值）、
   续期与争抢在到期边界三波并发恰有一方成功且无双重控制权。
+- `tests/test_control_generation.py` — 控制代次：连续交接（提前释放与自然到期）
+  代次严格递增且无空洞、获取/重放/令牌查询三处代次一致、同键并发重试只提交
+  一个代次、12 路屏障并发争抢空闲天线只提交一个新代次、忙/未知天线/参数冲突/
+  输入拒绝前后天线计数器与租约数据均不变且失败后首次成功紧接上一条已提交租约、
+  各天线代次互相独立；并在独立的临时数据库上验证 0004 迁移按
+  `(acquired_at, id)` 顺序为历史租约回填代次、计数器接续历史最大值、
+  降级再升级回填结果确定一致。
 
 测试不使用任何固定响应或假接口：全部通过 HTTP 打向真实服务，并直连真实
 PostgreSQL 制造并发、播种到期数据和断言提交结果。

@@ -34,7 +34,8 @@ ISO_OFFSET = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}$"
 )
 
-# The release feature must not change the acquisition/replay response shape.
+# The release feature must not change the acquisition/replay response shape
+# beyond the control generation every lease now carries.
 ACQUIRE_RESPONSE_FIELDS = {
     "antenna_id",
     "controller",
@@ -42,6 +43,7 @@ ACQUIRE_RESPONSE_FIELDS = {
     "acquired_at",
     "expires_at",
     "replay",
+    "control_generation",
 }
 
 
