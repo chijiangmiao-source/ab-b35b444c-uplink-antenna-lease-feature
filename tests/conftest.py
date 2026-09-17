@@ -59,7 +59,10 @@ def db_engine() -> Engine:
 def reset_lease_tables(db_engine: Engine):
     """Each test starts with a clean lease/idempotency state.
 
-    The seeded antenna catalog is intentionally preserved.
+    The seeded antenna catalog is intentionally preserved, but every
+    antenna's control-generation counter is rewound to 0 so it stays
+    consistent with the truncated lease history: the first acquisition in
+    any test is generation 1 again.
     """
     with db_engine.begin() as conn:
         conn.execute(
@@ -68,6 +71,7 @@ def reset_lease_tables(db_engine: Engine):
                 "lease_renewals, leases RESTART IDENTITY CASCADE"
             )
         )
+        conn.execute(text("UPDATE antennas SET last_control_generation = 0"))
     yield
 
 
@@ -150,20 +154,34 @@ def insert_expired_lease(
     controller: str = "expired-ctrl",
     token: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a lease that expired ``age_seconds`` ago, directly via SQL."""
+    """Insert a lease that expired ``age_seconds`` ago, directly via SQL.
+
+    The row consumes a control generation from the antenna's counter exactly
+    like a real acquisition, so the invariant "every lease owns the next
+    generation of its antenna" holds for seeded history as well.
+    """
     token = token or f"expired-{uuid.uuid4()}"
     with db_engine.begin() as conn:
         row = conn.execute(
             text(
                 """
+                WITH bumped AS (
+                    UPDATE antennas
+                    SET last_control_generation =
+                            last_control_generation + 1
+                    WHERE id = :antenna_id
+                    RETURNING last_control_generation AS gen
+                )
                 INSERT INTO leases (antenna_id, controller, token,
-                                    acquired_at, expires_at)
-                VALUES (
+                                    acquired_at, expires_at,
+                                    control_generation)
+                SELECT
                     :antenna_id, :controller, :token,
                     clock_timestamp() - make_interval(secs => :age + :ttl),
-                    clock_timestamp() - make_interval(secs => :age)
-                )
-                RETURNING token, acquired_at, expires_at
+                    clock_timestamp() - make_interval(secs => :age),
+                    bumped.gen
+                FROM bumped
+                RETURNING token, acquired_at, expires_at, control_generation
                 """
             ),
             {

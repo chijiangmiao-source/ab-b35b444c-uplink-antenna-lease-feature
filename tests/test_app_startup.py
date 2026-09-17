@@ -32,6 +32,7 @@ def test_both_response_models_serialise_timestamps_identically():
         "lease_token": "x" * 43,
         "acquired_at": instant,
         "expires_at": instant,
+        "control_generation": 7,
     }
 
     acquired = AcquireResponse(**common, replay=False).model_dump(mode="json")

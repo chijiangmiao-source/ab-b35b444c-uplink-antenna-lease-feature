@@ -41,6 +41,7 @@ ACQUIRE_RESPONSE_FIELDS = {
     "lease_token",
     "acquired_at",
     "expires_at",
+    "control_generation",
     "replay",
 }
 

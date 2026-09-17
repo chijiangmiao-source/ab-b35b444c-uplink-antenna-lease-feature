@@ -61,6 +61,11 @@ class _LeaseBase(BaseModel):
     lease_token: str
     acquired_at: datetime
     expires_at: datetime
+    # Monotonically increasing per-antenna control generation, allocated by
+    # the acquisition transaction and frozen onto the lease. An uplink
+    # device uses it to reject instructions from a stale (partitioned)
+    # controller: only the newest generation is authoritative.
+    control_generation: int
 
     @field_serializer("acquired_at", "expires_at", when_used="always")
     def _serialize_iso8601(self, value: datetime) -> str:

@@ -15,8 +15,12 @@ Concurrency design (all inside one READ COMMITTED transaction):
    whose ``expires_at`` has been reached (``expires_at <= clock_timestamp()``)
    is gone: the boundary belongs to the new request. A lease released early
    is also immediately available for handover.
-5. Insert the new lease (``expires_at = clock_timestamp() + make_interval``)
-   and its idempotency record, then commit atomically.
+5. Increment the antenna's ``last_control_generation`` and insert the new
+   lease (``expires_at = clock_timestamp() + make_interval``) stamped with
+   that generation, plus its idempotency record, then commit atomically.
+   The increment only happens on this success path, inside the transaction:
+   busy/unknown-antenna/conflict rejections roll back and never consume a
+   generation, so the next committed lease follows the previous one exactly.
 
 Progress reporting, early release and renewal take the same antenna row lock
 as lease acquisition. Every timestamp originates from PostgreSQL; the host
@@ -110,7 +114,8 @@ def acquire_lease(
             text(
                 """
                 SELECT id AS lease_id, antenna_id, controller,
-                       token AS lease_token, acquired_at, expires_at
+                       token AS lease_token, acquired_at, expires_at,
+                       control_generation
                 FROM leases
                 WHERE id = :lease_id
                 """
@@ -161,17 +166,28 @@ def acquire_lease(
             },
         )
 
-    # 5. Create lease + idempotency record atomically. Token comes from
-    #    PostgreSQL's CSPRNG so it is unpredictable on the wire. Standard
-    #    base64 contains '/', '+' and '=' which are unsafe in a single URL
-    #    path segment, so emit the base64url alphabet with padding stripped
-    #    (43 chars for 32 random bytes).
+    # 5. Create lease + idempotency record atomically, stamping the lease
+    #    with a freshly allocated control generation. The antenna row is
+    #    already locked FOR UPDATE from step 3, so the increment serialises
+    #    against every other contender: exactly one commit per generation
+    #    value, and a rolled-back (rejected) transaction consumes nothing.
+    #    Token comes from PostgreSQL's CSPRNG so it is unpredictable on the
+    #    wire. Standard base64 contains '/', '+' and '=' which are unsafe in
+    #    a single URL path segment, so emit the base64url alphabet with
+    #    padding stripped (43 chars for 32 random bytes).
     row = conn.execute(
         text(
             """
-            WITH new_lease AS (
-                INSERT INTO leases (antenna_id, controller, token, acquired_at, expires_at)
-                VALUES (
+            WITH bumped AS (
+                UPDATE antennas
+                SET last_control_generation = last_control_generation + 1
+                WHERE id = :antenna_id
+                RETURNING last_control_generation AS control_generation
+            ), new_lease AS (
+                INSERT INTO leases (antenna_id, controller, token,
+                                    acquired_at, expires_at,
+                                    control_generation)
+                SELECT
                     :antenna_id,
                     :controller,
                     rtrim(
@@ -182,10 +198,12 @@ def acquire_lease(
                         '='
                     ),
                     clock_timestamp(),
-                    clock_timestamp() + make_interval(secs => :duration)
-                )
+                    clock_timestamp() + make_interval(secs => :duration),
+                    bumped.control_generation
+                FROM bumped
                 RETURNING id AS lease_id, antenna_id, controller,
-                          token AS lease_token, acquired_at, expires_at
+                          token AS lease_token, acquired_at, expires_at,
+                          control_generation
             ), recorded AS (
                 INSERT INTO idempotency_keys (idempotency_key, lease_id, request_params)
                 SELECT :key, lease_id, :params
@@ -418,6 +436,7 @@ def get_lease_by_token(conn: Connection, token: str) -> dict[str, Any] | None:
             SELECT id AS lease_id, antenna_id, controller,
                    token, acquired_at, expires_at, released_at,
                    last_command_sequence, last_progress_at,
+                   control_generation,
                    (released_at IS NULL AND expires_at > clock_timestamp())
                        AS active
             FROM leases
@@ -578,6 +597,7 @@ def release_lease(conn: Connection, token: str) -> dict[str, Any]:
             SELECT id AS lease_id, antenna_id, controller, token,
                    acquired_at, expires_at, released_at,
                    last_command_sequence, last_progress_at,
+                   control_generation,
                    (expires_at > clock_timestamp()) AS unexpired
             FROM leases
             WHERE id = :lease_id

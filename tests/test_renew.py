@@ -56,6 +56,7 @@ ACQUIRE_RESPONSE_FIELDS = {
     "lease_token",
     "acquired_at",
     "expires_at",
+    "control_generation",
     "replay",
 }
 STATUS_RESPONSE_FIELDS = {
@@ -64,6 +65,7 @@ STATUS_RESPONSE_FIELDS = {
     "lease_token",
     "acquired_at",
     "expires_at",
+    "control_generation",
     "active",
     "last_command_sequence",
     "last_progress_at",
@@ -115,14 +117,23 @@ def _insert_near_future_lease(
         row = conn.execute(
             text(
                 """
+                WITH bumped AS (
+                    UPDATE antennas
+                    SET last_control_generation =
+                            last_control_generation + 1
+                    WHERE id = :antenna_id
+                    RETURNING last_control_generation AS gen
+                )
                 INSERT INTO leases (antenna_id, controller, token,
-                                    acquired_at, expires_at)
-                VALUES (
+                                    acquired_at, expires_at,
+                                    control_generation)
+                SELECT
                     :antenna_id, :controller, :token,
                     clock_timestamp() - make_interval(secs => :ttl - :left),
-                    clock_timestamp() + make_interval(secs => :left)
-                )
-                RETURNING token, acquired_at, expires_at
+                    clock_timestamp() + make_interval(secs => :left),
+                    bumped.gen
+                FROM bumped
+                RETURNING token, acquired_at, expires_at, control_generation
                 """
             ),
             {
